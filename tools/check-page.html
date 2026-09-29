@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<title>航线检查 · 长江 FPV</title>
+<style>
+  :root{--bg:#070b12;--ink:#e8eef6;--dim:#8fa2b8;--line:#22303f;--acc:#4fc3f7}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);
+    font:13px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC",Helvetica,Arial,sans-serif;
+    overscroll-behavior:none;touch-action:none;-webkit-user-select:none}
+  #cv{position:fixed;inset:0;display:block}
+  .hud{position:fixed;z-index:5;background:rgba(10,16,24,.82);border:1px solid var(--line);
+    border-radius:10px;padding:8px 10px;backdrop-filter:blur(8px)}
+  #top{left:10px;top:10px;max-width:min(430px,72vw)}
+  #top h1{margin:0 0 4px;font-size:13px;letter-spacing:.02em}
+  #top p{margin:2px 0;color:var(--dim);font-size:11.5px}
+  #layers{right:10px;top:10px;display:flex;flex-direction:column;gap:6px;font-size:12px}
+  #layers label{display:flex;align-items:center;gap:6px;cursor:pointer}
+  #bar{left:50%;transform:translateX(-50%);bottom:12px;display:flex;gap:6px;align-items:center;max-width:calc(100vw - 20px);overflow-x:auto;flex-wrap:nowrap}
+  #bar button{white-space:nowrap;flex:0 0 auto}
+  button{background:#132030;color:var(--ink);border:1px solid var(--line);border-radius:8px;
+    padding:7px 11px;font-size:12.5px;cursor:pointer}
+  button.on{background:#1d3550;border-color:#2b6ea8;color:#bfe6ff}
+  #readout{right:10px;bottom:12px;max-width:min(360px,80vw);font-size:12px;line-height:1.6}
+  #readout b{color:#ffd166}
+  #coord{color:var(--acc);word-break:break-all;font-family:ui-monospace,Menlo,monospace;font-size:11px}
+  #scalebar{position:fixed;left:10px;bottom:12px;z-index:5;color:var(--dim);font-size:11px}
+  #sb{height:8px;border:1px solid var(--dim);border-top:0;margin-top:2px}
+  .sw{display:inline-block;width:18px;height:3px;border-radius:2px;vertical-align:middle}
+
+@media (max-width: 560px){
+  #top{max-width:56vw;padding:6px 8px}
+  #top h1{font-size:12px;margin:0}
+  #top p{display:none}
+  #layers{top:8px;right:8px;padding:6px 8px;gap:4px;font-size:11.5px}
+  #bar{bottom:8px;padding:6px 8px;gap:5px}
+  #bar button{padding:6px 8px;font-size:12px}
+  #readout{bottom:60px;left:8px;right:8px;max-width:none;font-size:11.5px}
+  #scalebar{display:none}
+}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+
+<div class="hud" id="top">
+  <h1>航线检查<span id="zoomtag"></span></h1>
+  <p style="color:#8fa2b8">全分辨率底图 · 可放大到 800%</p>
+  <p>拖动=平移　双指/滚轮=缩放　<b>点一下 = 打十字并读出该点里程与经纬度</b>，可复制发我</p>
+  <p id="tip">坐标点直接写在本页 HTML 里，渲染只用一套矩阵变换（无任何额外换算），所以看到的与底图严格对齐。</p>
+</div>
+
+<div class="hud" id="layers">
+  <label><input type="checkbox" id="L0" checked><span class="sw" style="background:#9fb3c8"></span>你画的 32 点</label>
+  <label><input type="checkbox" id="L1" checked><span class="sw" style="background:#4fc3f7"></span>平滑航线</label>
+  <label><input type="checkbox" id="L2" checked><span class="sw" style="background:#ffb74d"></span>DEM 校正线</label>
+  <label><input type="checkbox" id="L3" checked><span class="sw" style="background:#ffd166"></span>里程刻度</label>
+  <label><input type="checkbox" id="L4"><span class="sw" style="background:#ffe9b0"></span>地标（含 GCJ 偏移）</label>
+</div>
+
+<div class="hud" id="bar">
+  <button id="bFit">全图</button>
+  <button id="b100">1:1</button>
+  <button id="bIn">＋</button>
+  <button id="bOut">－</button>
+  <button id="bCopy">复制坐标</button>
+  <button id="bClear">清除</button>
+</div>
+
+<div class="hud" id="readout">
+  <div id="ro">未取点</div>
+  <div id="coord"></div>
+</div>
+<div id="scalebar"><span id="sbt">1 km</span><div id="sb"></div></div>
+
+<script src="check_data_v2.js"></script>
+<script>
+const D = window.CHK, cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const dpr = Math.min(3, window.devicePixelRatio || 1);
+let view = { s: 0.12, tx: 0, ty: 0 };
+let cross = null;                    // 十字：影像像素坐标
+const tImg = {};
+
+/* ---------- 经纬度（与主程序同一套 Mercator 公式，GCJ 框架）---------- */
+const WPx = 256 * Math.pow(2, 13);
+const pxFromLon = l => (l + 180) / 360 * WPx;
+const pxFromLat = l => { const r = l * Math.PI / 180; return (1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * WPx; };
+const lonFromPx = p => p / WPx * 360 - 180;
+const latFromPx = p => { const n = Math.PI - 2 * Math.PI * p / WPx; return Math.atan(Math.sinh(n)) * 180 / Math.PI; };
+const LON0 = 110.91796875, LON1 = 111.5771484375, LAT0 = 30.486550842588485, LAT1 = 30.90222470517144;
+const X0 = pxFromLon(LON0), X1 = pxFromLon(LON1), Y0 = pxFromLat(LAT1), Y1 = pxFromLat(LAT0);
+const tex2geo = (x, y) => ({
+  lon: lonFromPx(X0 + x / D.TEXW * (X1 - X0)),
+  lat: latFromPx(Y0 + y / D.TEXH * (Y1 - Y0))
+});
+
+/* ---------- 视图 ---------- */
+function resize() {
+  cv.width = Math.round(innerWidth * dpr); cv.height = Math.round(innerHeight * dpr);
+  cv.style.width = innerWidth + 'px'; cv.style.height = innerHeight + 'px';
+}
+function fitImage() {
+  const s = Math.min(innerWidth / D.TEXW, innerHeight / D.TEXH) * 0.96;
+  view.s = s; view.tx = (innerWidth - D.TEXW * s) / 2; view.ty = (innerHeight - D.TEXH * s) / 2;
+}
+function fitRoute() {
+  let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
+  D.smooth.forEach(([x,y])=>{x0=Math.min(x0,x);y0=Math.min(y0,y);x1=Math.max(x1,x);y1=Math.max(y1,y);});
+  const pw=(x1-x0)*0.10, ph=(y1-y0)*0.10;
+  const s=Math.min(innerWidth/(x1-x0+2*pw), innerHeight/(y1-y0+2*ph));
+  const cx=(x0+x1)/2, cy=(y0+y1)/2;
+  view.s=s; view.tx=innerWidth/2-cx*s; view.ty=innerHeight/2-cy*s;
+}
+function zoomAt(f, sx, sy) {
+  const ix = (sx - view.tx) / view.s, iy = (sy - view.ty) / view.s;
+  view.s = Math.max(0.04, Math.min(8, view.s * f));
+  view.tx = sx - ix * view.s; view.ty = sy - iy * view.s; draw();
+}
+const toImg = (sx, sy) => [(sx - view.tx) / view.s, (sy - view.ty) / view.s];
+const toScr = (ix, iy) => [ix * view.s + view.tx, iy * view.s + view.ty];
+
+/* ---------- 瓦片 ---------- */
+function ensureTile(i, j) {
+  const k = j * D.COLS + i;
+  if (!tImg[k]) { const im = new Image(); im.onload = draw; im.src = 'tiles/t' + j + i + '.jpg'; tImg[k] = im; }
+  return tImg[k];
+}
+
+/* ---------- 绘制 ---------- */
+function draw() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#0b0f14'; ctx.fillRect(0, 0, innerWidth, innerHeight);
+  ctx.save();
+  ctx.translate(view.tx, view.ty); ctx.scale(view.s, view.s);
+  const x0 = (0 - view.tx) / view.s, y0 = (0 - view.ty) / view.s;
+  const x1 = (innerWidth - view.tx) / view.s, y1 = (innerHeight - view.ty) / view.s;
+  for (let j = 0; j < D.ROWS; j++) for (let i = 0; i < D.COLS; i++) {
+    const tx = i * D.TW, ty = j * D.TH;
+    if (tx + D.TW < x0 || tx > x1 || ty + D.TH < y0 || ty > y1) continue;
+    const im = ensureTile(i, j);
+    if (im.complete && im.naturalWidth) { ctx.imageSmoothingEnabled = view.s < 1; ctx.drawImage(im, tx, ty, D.TW, D.TH); }
+  }
+  const lw = v => v / view.s;
+  const line = (P, color, w, dash, glow) => {
+    ctx.save(); ctx.setLineDash(dash || []); ctx.lineJoin = ctx.lineCap = 'round';
+    const draw1 = (wd, col) => { ctx.beginPath(); P.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.strokeStyle = col; ctx.lineWidth = lw(wd); ctx.stroke(); };
+    if (glow) draw1(w + 3, glow);
+    draw1(w, color); ctx.restore();
+  };
+  if (document.getElementById('L2').checked && D.snap.length) line(D.snap, '#ffb74d', 2.4, [lw(7), lw(6)]);
+  if (document.getElementById('L1').checked) line(D.smooth, '#4fc3f7', 2.6, null, 'rgba(79,195,247,.30)');
+  if (document.getElementById('L0').checked) {
+    line(D.orig, 'rgba(159,179,200,.9)', 1.6, [lw(6), lw(5)]);
+    D.orig.forEach(p => { ctx.beginPath(); ctx.arc(p[0], p[1], lw(3.6), 0, 7); ctx.fillStyle = '#e8eef6'; ctx.fill(); });
+  }
+  if (document.getElementById('L3').checked) {
+    ctx.font = lw(11) + 'px -apple-system,"PingFang SC",sans-serif';
+    const P = D.smooth, K = D.km_s;
+    const kmPx = (K[K.length - 1] * 1000 / D.MPP) * view.s / K[K.length - 1];  // 屏幕上每公里多少像素
+    let step = 50;
+    for (const v of [5, 10, 20]) { if (v * kmPx >= 78) { step = v; break; } }
+    for (let k = step; k < D.len_s; k += step) {
+      let i = 1; while (i < K.length - 1 && K[i] < k) i++;
+      const t = (k - K[i - 1]) / ((K[i] - K[i - 1]) || 1);
+      const x = P[i - 1][0] + (P[i][0] - P[i - 1][0]) * t, y = P[i - 1][1] + (P[i][1] - P[i - 1][1]) * t;
+      const dx = P[i][0] - P[i - 1][0], dy = P[i][1] - P[i - 1][1], n = Math.hypot(dx, dy) || 1;
+      const ox = -dy / n * lw(16), oy = dx / n * lw(16);
+      ctx.beginPath(); ctx.arc(x, y, lw(3), 0, 7); ctx.fillStyle = '#ffd166'; ctx.fill();
+      ctx.fillStyle = 'rgba(0,0,0,.72)'; ctx.strokeStyle = 'rgba(0,0,0,.72)'; ctx.lineWidth = lw(3);
+      ctx.strokeText(k + 'km', x + ox, y + oy); ctx.fillStyle = '#ffd166'; ctx.fillText(k + 'km', x + ox, y + oy);
+    }
+  }
+  if (document.getElementById('L4').checked) {
+    ctx.font = lw(11) + 'px -apple-system,"PingFang SC",sans-serif';
+    Object.entries(D.landmarks).forEach(([n, p]) => {
+      ctx.beginPath(); ctx.arc(p[0], p[1], lw(3.4), 0, 7); ctx.fillStyle = '#ffe9b0'; ctx.fill();
+      ctx.lineWidth = lw(3); ctx.strokeStyle = 'rgba(0,0,0,.8)';
+      ctx.strokeText(n, p[0] + lw(6), p[1] + lw(3.5));
+      ctx.fillStyle = '#ffe9b0'; ctx.fillText(n, p[0] + lw(6), p[1] + lw(3.5));
+    });
+  }
+  ctx.restore();
+
+  if (cross) {                                     // 十字（屏幕坐标画，永远清楚）
+    const [cx, cy] = toScr(cross[0], cross[1]);
+    ctx.save(); ctx.strokeStyle = '#ff5c8a'; ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.moveTo(cx - 16, cy); ctx.lineTo(cx + 16, cy);
+    ctx.moveTo(cx, cy - 16); ctx.lineTo(cx, cy + 16); ctx.stroke();
+    ctx.beginPath(); ctx.arc(cx, cy, 7, 0, 7); ctx.stroke();
+    ctx.restore();
+  }
+  const kmPerPx = (D.MPP * dpr) / view.s * (dpr / dpr);   // 每个屏幕像素对应的米
+  const mPerCssPx = D.MPP / view.s;
+  const bars = [1, 2, 5, 10, 20, 50, 100, 200];
+  let pick = bars[0]; bars.forEach(b => { if (b * 1000 / mPerCssPx < Math.min(220, innerWidth * .34)) pick = b; });
+  const px = pick * 1000 / mPerCssPx;
+  document.getElementById('sb').style.width = px + 'px';
+  document.getElementById('sbt').textContent = pick + ' km';
+  document.getElementById('zoomtag').textContent = ' · 缩放 ' + Math.round(view.s * 100) + '%';
+}
+
+/* ---------- 取点 ---------- */
+function nearestKm(ix, iy) {
+  const P = D.smooth, K = D.km_s;
+  let bd = 1e18, bk = 0, bp = null;
+  for (let i = 1; i < P.length; i++) {
+    const a = P[i - 1], b = P[i], vx = b[0] - a[0], vy = b[1] - a[1], L2 = vx * vx + vy * vy || 1;
+    let t = ((ix - a[0]) * vx + (iy - a[1]) * vy) / L2; t = t < 0 ? 0 : t > 1 ? 1 : t;
+    const px = a[0] + vx * t, py = a[1] + vy * t, d = Math.hypot(ix - px, iy - py);
+    if (d < bd) { bd = d; bk = K[i - 1] + (K[i] - K[i - 1]) * t; bp = [px, py]; }
+  }
+  return { km: bk, dist: bd * D.MPP, at: bp };
+}
+function setCross(ix, iy) {
+  cross = [ix, iy];
+  const g = tex2geo(ix, iy), m = nearestKm(ix, iy);
+  const dx = (ix - m.at[0]) * D.MPP, dy = (iy - m.at[1]) * D.MPP;
+  const side = Math.abs(dx) < 1 && Math.abs(dy) < 1 ? '正好在航线上'
+    : (dx < 0 ? '航线以西 ' : '航线以东 ') + Math.abs(Math.round(dx)) + ' m，' + (dy < 0 ? '以北 ' : '以南 ') + Math.abs(Math.round(dy)) + ' m';
+  document.getElementById('ro').innerHTML =
+    '十字处：沿线里程 <b>' + m.km.toFixed(2) + ' km</b>　离航线 <b>' + Math.round(m.dist) + ' m</b><br>' + side;
+  document.getElementById('coord').textContent =
+    '主纹理 px (' + ix.toFixed(1) + ', ' + iy.toFixed(1) + ')　GCJ ' + g.lon.toFixed(6) + ', ' + g.lat.toFixed(6);
+  draw();
+}
+
+/* ---------- 交互 ---------- */
+let ptrs = new Map(), mode = null, start = null, pinch = null;
+cv.addEventListener('pointerdown', e => {
+  try { cv.setPointerCapture(e.pointerId); } catch (_) { }
+  ptrs.set(e.pointerId, [e.clientX, e.clientY]);
+  if (ptrs.size === 1) { mode = 'pan'; start = { x: e.clientX, y: e.clientY, tx: view.tx, ty: view.ty, t: Date.now() }; }
+  else if (ptrs.size === 2) {
+    const [a, b] = [...ptrs.values()];
+    pinch = { d: Math.hypot(a[0] - b[0], a[1] - b[1]), s: view.s };
+    mode = 'pinch';
+  }
+});
+cv.addEventListener('pointermove', e => {
+  if (!ptrs.has(e.pointerId)) return;
+  ptrs.set(e.pointerId, [e.clientX, e.clientY]);
+  if (mode === 'pan' && ptrs.size === 1) {
+    view.tx = start.tx + (e.clientX - start.x); view.ty = start.ty + (e.clientY - start.y); draw();
+  } else if (mode === 'pinch' && ptrs.size >= 2) {
+    const [a, b] = [...ptrs.values()];
+    const d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+    const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+    const f = d / (pinch.d || d);
+    const ix = (mid[0] - view.tx) / view.s, iy = (mid[1] - view.ty) / view.s;
+    view.s = Math.max(0.04, Math.min(8, pinch.s * f));
+    view.tx = mid[0] - ix * view.s; view.ty = mid[1] - iy * view.s; draw();
+  }
+});
+cv.addEventListener('pointerup', e => {
+  const st = start;
+  ptrs.delete(e.pointerId);
+  if (ptrs.size === 0) {
+    if (mode === 'pan' && st && Math.hypot(e.clientX - st.x, e.clientY - st.y) < 8 && Date.now() - st.t < 600) {
+      const [ix, iy] = toImg(e.clientX, e.clientY); setCross(ix, iy);
+    }
+    mode = null; pinch = null;
+  }
+});
+cv.addEventListener('wheel', e => { e.preventDefault(); zoomAt(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.clientX, e.clientY); }, { passive: false });
+document.getElementById('bFit').onclick = () => { fitImage(); draw(); };
+document.getElementById('b100').onclick = () => { const c = toImg(innerWidth / 2, innerHeight / 2); view.s = 1; view.tx = innerWidth / 2 - c[0]; view.ty = innerHeight / 2 - c[1]; draw(); };
+document.getElementById('bIn').onclick = () => zoomAt(1.4, innerWidth / 2, innerHeight / 2);
+document.getElementById('bOut').onclick = () => zoomAt(1 / 1.4, innerWidth / 2, innerHeight / 2);
+document.getElementById('bClear').onclick = () => { cross = null; document.getElementById('ro').textContent = '未取点'; document.getElementById('coord').textContent = ''; draw(); };
+document.getElementById('bCopy').onclick = async () => {
+  if (!cross) return;
+  const g = tex2geo(cross[0], cross[1]), m = nearestKm(cross[0], cross[1]);
+  const s = JSON.stringify({ tex: [+cross[0].toFixed(1), +cross[1].toFixed(1)], gcj: [+g.lon.toFixed(6), +g.lat.toFixed(6)], km_on_route: +m.km.toFixed(2), off_route_m: Math.round(m.dist) });
+  try { await navigator.clipboard.writeText(s); document.getElementById('coord').textContent = '已复制：' + s; }
+  catch (_) { document.getElementById('coord').textContent = s; }
+  draw();
+};
+['L0', 'L1', 'L2', 'L3', 'L4'].forEach(id => document.getElementById(id).onchange = draw);
+addEventListener('resize', () => { resize(); draw(); });
+resize(); fitRoute(); draw();
+</script>
+</body>
+</html>
